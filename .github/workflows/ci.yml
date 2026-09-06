@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:      # cho phép bấm chạy tay trên tab Actions
+
+# Hủy run cũ nếu push liên tiếp -> tiết kiệm phút CI
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  godot-check:
+    name: Import + kiểm tra cú pháp GDScript
+    runs-on: ubuntu-latest
+    container:
+      # Tag phải khớp phiên bản Godot đang dùng ở máy local (godot --version)
+      image: barichello/godot-ci:4.7.2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # Container chạy bằng root nên git coi thư mục là "dubious ownership"
+      - name: Cho phép git đọc workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Kiểm tra mọi Godot project trong repo
+        run: |
+          set -uo pipefail
+          failed=0
+          found=0
+
+          # Tự tìm mọi project.godot -> không phải sửa file này mỗi khi thêm prototype
+          while IFS= read -r proj; do
+            dir=$(dirname "$proj")
+            found=$((found + 1))
+            echo "::group::📦 $dir"
+
+            echo "--- Import (sinh .godot cache, kiểm tra project mở được) ---"
+            ( cd "$dir" && godot --headless --import ) \
+              || { echo "❌ Import thất bại: $dir"; failed=1; }
+
+            echo "--- Kiểm tra cú pháp từng script ---"
+            while IFS= read -r gd; do
+              rel="res://${gd#"$dir"/}"
+              if ( cd "$dir" && godot --headless --check-only --script "$rel" ); then
+                echo "  ✅ $rel"
+              else
+                echo "  ❌ $rel"
+                failed=1
+              fi
+            done < <(find "$dir" -name '*.gd' -not -path '*/.godot/*' -not -path '*/addons/*' | sort)
+
+            echo "::endgroup::"
+          done < <(find . -name project.godot -not -path '*/.godot/*' | sort)
+
+          echo "═══════════════════════════════"
+          echo "Đã kiểm tra $found Godot project"
+          if [ "$found" -eq 0 ]; then
+            echo "❌ Không tìm thấy project.godot nào"
+            exit 1
+          fi
+          exit $failed

@@ -310,36 +310,209 @@ git lfs env | head -5   # xác nhận endpoint LFS đã trỏ đúng remote
 
 ## Buổi 4 (1.5h) — CI đầu tiên
 
-`.github/workflows/ci.yml` — bước đầu chỉ kiểm tra project mở được và script không lỗi cú pháp:
+> **Mục tiêu:** mỗi lần push, GitHub tự động mở project Godot trong môi trường sạch và kiểm tra mọi script có lỗi cú pháp không. Đây là lưới an toàn giúp bạn biết ngay khi làm hỏng thứ gì.
+
+### 4.0. Vì sao solo dev vẫn cần CI?
+
+Nghe vô lý — chỉ có một người, chạy được trên máy mình là xong. Nhưng CI bắt được đúng ba loại lỗi mà máy local giấu đi:
+
+| Lỗi | Máy local vì sao không thấy | CI thấy vì |
+|---|---|---|
+| Quên commit một file | File vẫn nằm trên đĩa nên game chạy bình thường | CI clone repo sạch, thiếu file là lỗi ngay |
+| Tham chiếu hỏng sau khi đổi tên | Godot còn cache trong `.godot/` | CI import từ đầu, không có cache |
+| Sai chữ hoa/thường trong đường dẫn | Vẫn chạy trên một số hệ thống file | CI dùng Linux phân biệt hoa/thường nghiêm ngặt |
+
+Cộng thêm: badge xanh trên README là tín hiệu chất lượng rõ ràng nhất cho người xem portfolio.
+
+### 4.1. Chọn Docker image đúng phiên bản
+
+Workflow chạy Godot trong container. Image `barichello/godot-ci` đã cài sẵn Godot + export template.
+
+**Tag phải khớp phiên bản Godot ở máy bạn**, nếu không sẽ gặp lỗi khó hiểu do khác định dạng file scene:
+
+```bash
+godot --version                    # ví dụ: 4.7.2.stable.official
+# -> dùng image barichello/godot-ci:4.7.2
+```
+
+Xem danh sách tag có sẵn:
+
+```bash
+curl -s "https://hub.docker.com/v2/repositories/barichello/godot-ci/tags?page_size=100" \
+  | python3 -c "import sys,json;[print(t['name']) for t in json.load(sys.stdin)['results']]"
+```
+
+> Dùng tag cụ thể (`4.7.2`), **không dùng `latest`** — `latest` sẽ tự nhảy phiên bản và làm CI hỏng vào một ngày bạn không ngờ.
+
+### 4.2. Hai lệnh Godot mà CI dựa vào
+
+```bash
+godot --headless --import
+```
+Quét toàn bộ asset, sinh lại thư mục `.godot/`. Nếu một scene tham chiếu file không tồn tại, lỗi lộ ra ở đây.
+
+```bash
+godot --headless --check-only --script res://main.gd
+```
+Phân tích cú pháp một script mà không chạy nó. **Trả exit code 1 khi có lỗi** — đây là điều khiến nó dùng được trong CI.
+
+> ⚠️ Khi tự kiểm tra ở terminal, đừng nối `| tail` hay `| grep` vào sau: `$?` khi đó là exit code của lệnh cuối trong pipe chứ không phải của Godot, và bạn sẽ tưởng nhầm là mọi thứ đều pass. Ghi ra file rồi đọc: `godot ... > /tmp/out.log 2>&1; echo $?`
+
+### 4.3. File workflow
+
+Tạo `.github/workflows/ci.yml`:
 
 ```yaml
 name: CI
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:      # cho phép bấm chạy tay trên tab Actions
+
+# Hủy run cũ nếu push liên tiếp -> tiết kiệm phút CI
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  check:
+  godot-check:
+    name: Import + kiểm tra cú pháp GDScript
     runs-on: ubuntu-latest
     container:
-      image: barichello/godot-ci:4.3.0   # đổi tag theo phiên bản Godot bạn dùng
+      image: barichello/godot-ci:4.7.2
+
     steps:
-      - uses: actions/checkout@v4
-        with: { lfs: true }
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
 
-      - name: Import project (tạo .godot cache)
-        run: |
-          cd prototypes/00-hello
-          godot --headless --import || true
+      - name: Cho phép git đọc workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Kiểm tra lỗi script
+      - name: Kiểm tra mọi Godot project trong repo
         run: |
-          cd prototypes/00-hello
-          godot --headless --check-only --script res://main.gd
+          set -uo pipefail
+          failed=0
+          found=0
+
+          while IFS= read -r proj; do
+            dir=$(dirname "$proj")
+            found=$((found + 1))
+            echo "::group::📦 $dir"
+
+            ( cd "$dir" && godot --headless --import ) \
+              || { echo "❌ Import thất bại: $dir"; failed=1; }
+
+            while IFS= read -r gd; do
+              rel="res://${gd#"$dir"/}"
+              if ( cd "$dir" && godot --headless --check-only --script "$rel" ); then
+                echo "  ✅ $rel"
+              else
+                echo "  ❌ $rel"
+                failed=1
+              fi
+            done < <(find "$dir" -name '*.gd' -not -path '*/.godot/*' -not -path '*/addons/*' | sort)
+
+            echo "::endgroup::"
+          done < <(find . -name project.godot -not -path '*/.godot/*' | sort)
+
+          echo "Đã kiểm tra $found Godot project"
+          if [ "$found" -eq 0 ]; then echo "❌ Không tìm thấy project.godot nào"; exit 1; fi
+          exit $failed
 ```
 
-> Ở [P3](06-phase-3-engineering.md) bạn sẽ mở rộng workflow này thành: chạy GUT test + export build Web + upload lên itch.io tự động.
+**Bốn chi tiết đáng chú ý:**
+
+| Chi tiết | Vì sao |
+|---|---|
+| `find . -name project.godot` thay vì ghi cứng `prototypes/00-hello` | Tuần 1–4 bạn sẽ tạo thêm `01-pong`, `02-breakout`… CI tự nhận, không phải sửa file này mỗi tuần |
+| `safe.directory` | Container chạy bằng root nên git từ chối thư mục "dubious ownership". Thiếu dòng này là lỗi ngay bước đầu |
+| `lfs: true` | Không có thì LFS chỉ tải về file con trỏ text, asset thật không có → import hỏng |
+| `-not -path '*/addons/*'` | Bỏ qua code thư viện bên thứ ba (GUT ở P3) — lỗi của họ không phải việc của bạn |
+| `concurrency` | Push 3 lần liên tiếp thì chỉ chạy lần cuối, tiết kiệm phút CI |
+
+### 4.4. Tự kiểm tra ở máy trước khi push
+
+Đừng dùng GitHub làm nơi thử sai — mỗi lần push hỏng là một lần chờ. Chạy đúng logic đó ở local:
+
+```bash
+cd /home/wk/projects/game-1
+for proj in $(find . -name project.godot -not -path '*/.godot/*'); do
+  dir=$(dirname "$proj")
+  ( cd "$dir" && godot --headless --import >/dev/null 2>&1 )
+  for gd in $(find "$dir" -name '*.gd' -not -path '*/.godot/*'); do
+    rel="res://${gd#"$dir"/}"
+    ( cd "$dir" && godot --headless --check-only --script "$rel" >/dev/null 2>&1 ) \
+      && echo "✅ $rel" || echo "❌ $rel"
+  done
+done
+```
+
+**Bài tập bắt buộc — kiểm chứng CI thật sự có tác dụng:**
+
+Rất nhiều người dựng CI xong không bao giờ kiểm tra xem nó có *bắt được lỗi* hay không, và sống với một badge xanh vô nghĩa. Làm phép thử ba bước:
+
+```bash
+# 1. Tạo file sai cú pháp
+cat > prototypes/00-hello/_broken.gd <<'GD'
+extends Node2D
+func _ready() -> void:
+	if true
+		print("thiếu dấu hai chấm")
+GD
+
+# 2. Chạy lại đoạn kiểm tra ở trên -> PHẢI thấy ❌
+
+# 3. Dọn
+rm -f prototypes/00-hello/_broken.gd prototypes/00-hello/_broken.gd.uid
+```
+
+Chỉ khi bước 2 thất bại đúng như mong đợi thì CI mới đáng tin.
+
+### 4.5. Badge trên README
+
+Thêm vào đầu `README.md` ở gốc repo:
+
+```markdown
+[![CI](https://github.com/<user>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<user>/<repo>/actions/workflows/ci.yml)
+```
+
+Badge chỉ hiện đúng sau khi workflow chạy lần đầu.
+
+### 4.6. Push và xem kết quả
+
+```bash
+git add .github README.md
+git commit -m "ci: thêm workflow kiểm tra import + cú pháp GDScript"
+git push
+```
+
+Mở `https://github.com/<user>/<repo>/actions` để xem. Lần chạy đầu mất 2–4 phút (phải tải image ~1GB); các lần sau nhanh hơn nhờ cache.
+
+**Nếu CI đỏ, đọc log theo thứ tự này:** bước nào fail → mở group của project đó → tìm dòng `❌` → tên script chính là chỗ lỗi.
+
+| Lỗi thường gặp | Nguyên nhân | Cách sửa |
+|---|---|---|
+| `manifest unknown` | Tag image không tồn tại | Kiểm tra lại danh sách tag ở §4.1 |
+| `detected dubious ownership` | Thiếu bước `safe.directory` | Thêm bước đó |
+| `Failed to load resource` | Asset chưa commit, hoặc LFS chưa bật | `git status`, kiểm tra `lfs: true` |
+| Local pass mà CI fail | Máy local còn cache `.godot/` | Xóa `.godot/` ở local rồi thử lại |
+
+---
+
+### Checklist nghiệm thu Buổi 4
+
+- [ ] `godot --version` khớp với tag image trong `ci.yml`
+- [ ] `.github/workflows/ci.yml` tồn tại, YAML hợp lệ (`python3 -c "import yaml;yaml.safe_load(open('.github/workflows/ci.yml'))"`)
+- [ ] Chạy đoạn kiểm tra local ở §4.4 → tất cả ✅
+- [ ] **Đã làm phép thử file lỗi** và thấy ❌ đúng như mong đợi
+- [ ] Đã commit + push
+- [ ] Tab **Actions** trên GitHub có một lần chạy **màu xanh**
+- [ ] README hiển thị badge xanh
+- [ ] Thử tạo PR với script lỗi → CI **chặn** được (tùy chọn, nhưng nên làm một lần cho biết)
 
 ---
 
