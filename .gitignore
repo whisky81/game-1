@@ -1,0 +1,9 @@
+.godot/
+android/
+export_presets.cfg
+build/
+*.zip
+*.x86_64
+*.wasm
+.DS_Store
+.vscode/settings.json
