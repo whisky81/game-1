@@ -16,7 +16,7 @@ jobs:
     name: Import + kiểm tra cú pháp GDScript
     runs-on: ubuntu-latest
     container:
-      # Tag phải khớp phiên bản Godot đang dùng ở máy local (godot --version)
+      # Tag phải khớp phiên bản Godot ở máy local (godot --version)
       image: barichello/godot-ci:4.7.2
 
     steps:
@@ -29,40 +29,48 @@ jobs:
       - name: Cho phép git đọc workspace
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      # LƯU Ý: step trong container chạy bằng `sh -e` (dash), KHÔNG phải bash.
+      # Script dưới đây là POSIX thuần: không `pipefail`, không `< <(...)`.
+      # Dùng file tạm thay cho pipe vì pipe tạo subshell làm mất biến $failed.
       - name: Kiểm tra mọi Godot project trong repo
         run: |
-          set -uo pipefail
           failed=0
           found=0
+          tmp="${RUNNER_TEMP:-/tmp}"
 
-          # Tự tìm mọi project.godot -> không phải sửa file này mỗi khi thêm prototype
+          find . -name project.godot -not -path '*/.godot/*' | sort > "$tmp/projects.txt"
+
           while IFS= read -r proj; do
             dir=$(dirname "$proj")
             found=$((found + 1))
-            echo "::group::📦 $dir"
+            echo "::group::[PROJECT] $dir"
 
             echo "--- Import (sinh .godot cache, kiểm tra project mở được) ---"
-            ( cd "$dir" && godot --headless --import ) \
-              || { echo "❌ Import thất bại: $dir"; failed=1; }
+            if ! (cd "$dir" && godot --headless --import); then
+              echo "[FAIL] Import that bai: $dir"
+              failed=1
+            fi
 
-            echo "--- Kiểm tra cú pháp từng script ---"
+            echo "--- Kiem tra cu phap tung script ---"
+            find "$dir" -name '*.gd' -not -path '*/.godot/*' -not -path '*/addons/*' \
+              | sort > "$tmp/scripts.txt"
             while IFS= read -r gd; do
               rel="res://${gd#"$dir"/}"
-              if ( cd "$dir" && godot --headless --check-only --script "$rel" ); then
-                echo "  ✅ $rel"
+              if (cd "$dir" && godot --headless --check-only --script "$rel"); then
+                echo "  [OK]   $rel"
               else
-                echo "  ❌ $rel"
+                echo "  [FAIL] $rel"
                 failed=1
               fi
-            done < <(find "$dir" -name '*.gd' -not -path '*/.godot/*' -not -path '*/addons/*' | sort)
+            done < "$tmp/scripts.txt"
 
             echo "::endgroup::"
-          done < <(find . -name project.godot -not -path '*/.godot/*' | sort)
+          done < "$tmp/projects.txt"
 
-          echo "═══════════════════════════════"
-          echo "Đã kiểm tra $found Godot project"
+          echo "==============================="
+          echo "Da kiem tra $found Godot project"
           if [ "$found" -eq 0 ]; then
-            echo "❌ Không tìm thấy project.godot nào"
+            echo "[FAIL] Khong tim thay project.godot nao"
             exit 1
           fi
-          exit $failed
+          exit "$failed"

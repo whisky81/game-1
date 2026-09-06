@@ -381,6 +381,7 @@ jobs:
     name: Import + kiểm tra cú pháp GDScript
     runs-on: ubuntu-latest
     container:
+      # Tag phải khớp phiên bản Godot ở máy local (godot --version)
       image: barichello/godot-ci:4.7.2
 
     steps:
@@ -389,39 +390,55 @@ jobs:
         with:
           lfs: true
 
+      # Container chạy bằng root nên git coi thư mục là "dubious ownership"
       - name: Cho phép git đọc workspace
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      # LƯU Ý: step trong container chạy bằng `sh -e` (dash), KHÔNG phải bash.
+      # Script dưới đây là POSIX thuần: không `pipefail`, không `< <(...)`.
+      # Dùng file tạm thay cho pipe vì pipe tạo subshell làm mất biến $failed.
       - name: Kiểm tra mọi Godot project trong repo
         run: |
-          set -uo pipefail
           failed=0
           found=0
+          tmp="${RUNNER_TEMP:-/tmp}"
+
+          find . -name project.godot -not -path '*/.godot/*' | sort > "$tmp/projects.txt"
 
           while IFS= read -r proj; do
             dir=$(dirname "$proj")
             found=$((found + 1))
-            echo "::group::📦 $dir"
+            echo "::group::[PROJECT] $dir"
 
-            ( cd "$dir" && godot --headless --import ) \
-              || { echo "❌ Import thất bại: $dir"; failed=1; }
+            echo "--- Import (sinh .godot cache, kiểm tra project mở được) ---"
+            if ! (cd "$dir" && godot --headless --import); then
+              echo "[FAIL] Import that bai: $dir"
+              failed=1
+            fi
 
+            echo "--- Kiem tra cu phap tung script ---"
+            find "$dir" -name '*.gd' -not -path '*/.godot/*' -not -path '*/addons/*' \
+              | sort > "$tmp/scripts.txt"
             while IFS= read -r gd; do
               rel="res://${gd#"$dir"/}"
-              if ( cd "$dir" && godot --headless --check-only --script "$rel" ); then
-                echo "  ✅ $rel"
+              if (cd "$dir" && godot --headless --check-only --script "$rel"); then
+                echo "  [OK]   $rel"
               else
-                echo "  ❌ $rel"
+                echo "  [FAIL] $rel"
                 failed=1
               fi
-            done < <(find "$dir" -name '*.gd' -not -path '*/.godot/*' -not -path '*/addons/*' | sort)
+            done < "$tmp/scripts.txt"
 
             echo "::endgroup::"
-          done < <(find . -name project.godot -not -path '*/.godot/*' | sort)
+          done < "$tmp/projects.txt"
 
-          echo "Đã kiểm tra $found Godot project"
-          if [ "$found" -eq 0 ]; then echo "❌ Không tìm thấy project.godot nào"; exit 1; fi
-          exit $failed
+          echo "==============================="
+          echo "Da kiem tra $found Godot project"
+          if [ "$found" -eq 0 ]; then
+            echo "[FAIL] Khong tim thay project.godot nao"
+            exit 1
+          fi
+          exit "$failed"
 ```
 
 **Bốn chi tiết đáng chú ý:**
@@ -433,6 +450,45 @@ jobs:
 | `lfs: true` | Không có thì LFS chỉ tải về file con trỏ text, asset thật không có → import hỏng |
 | `-not -path '*/addons/*'` | Bỏ qua code thư viện bên thứ ba (GUT ở P3) — lỗi của họ không phải việc của bạn |
 | `concurrency` | Push 3 lần liên tiếp thì chỉ chạy lần cuối, tiết kiệm phút CI |
+| Script viết theo **POSIX**, không dùng `set -o pipefail` hay `< <(...)` | Xem §4.3.1 — đây là lỗi hầu như ai cũng gặp lần đầu |
+
+### 4.3.1. ⚠️ Bẫy lớn nhất: step trong container chạy bằng `sh`, không phải bash
+
+Khi job dùng `container:`, GitHub Actions thực thi mỗi step bằng **`sh -e {0}`**. Trên image nền Debian/Ubuntu, `/bin/sh` là **dash** — không phải bash. Mọi bashism sẽ chết ngay:
+
+```
+/__w/_temp/xxxx.sh: 1: set: Illegal option -o pipefail
+Error: Process completed with exit code 2.
+```
+
+Ba bashism hay dùng nhất mà dash không có:
+
+| Bashism | Vấn đề | Thay bằng |
+|---|---|---|
+| `set -o pipefail` | dash không hỗ trợ `-o pipefail` | Bỏ đi, chỉ dùng `set -u` (hoặc để `sh -e` mặc định lo) |
+| `while ... done < <(command)` (process substitution) | Cú pháp riêng của bash | Ghi ra file tạm rồi `done < "$tmp/file.txt"` |
+| `[[ ... ]]` | Từ khóa của bash | Dùng `[ ... ]` |
+
+**Vì sao dùng file tạm chứ không phải pipe?** Viết `find ... | while read ...` thì vòng lặp chạy trong subshell, nên biến `failed=1` gán bên trong **mất sạch** khi ra khỏi vòng lặp — CI sẽ luôn xanh dù có lỗi. Đọc từ file (`done < file`) thì vòng lặp chạy ở shell chính, biến giữ nguyên giá trị.
+
+Hai cách xử lý, chọn một:
+
+```yaml
+# Cách A (dùng ở đây): viết POSIX thuần -> chạy được trên mọi shell
+- name: Kiểm tra
+  run: |
+    failed=0
+    ...
+
+# Cách B: ép dùng bash (chỉ được nếu image có sẵn bash)
+- name: Kiểm tra
+  shell: bash
+  run: |
+    set -euo pipefail
+    ...
+```
+
+Cách A bền hơn vì không phụ thuộc vào việc image có cài bash hay không.
 
 ### 4.4. Tự kiểm tra ở máy trước khi push
 
@@ -506,6 +562,7 @@ Mở `https://github.com/<user>/<repo>/actions` để xem. Lần chạy đầu m
 ### Checklist nghiệm thu Buổi 4
 
 - [ ] `godot --version` khớp với tag image trong `ci.yml`
+- [ ] Script trong workflow là POSIX (test bằng `/bin/sh -e script.sh`, không phải `bash`)
 - [ ] `.github/workflows/ci.yml` tồn tại, YAML hợp lệ (`python3 -c "import yaml;yaml.safe_load(open('.github/workflows/ci.yml'))"`)
 - [ ] Chạy đoạn kiểm tra local ở §4.4 → tất cả ✅
 - [ ] **Đã làm phép thử file lỗi** và thấy ❌ đúng như mong đợi
