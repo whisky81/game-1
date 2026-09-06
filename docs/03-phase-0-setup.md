@@ -290,7 +290,7 @@ git lfs env | head -5   # xác nhận endpoint LFS đã trỏ đúng remote
 - [ ] `git status` → clean, không còn file untracked
 - [ ] `git ls-files | grep '\.godot/'` → **không có kết quả nào** (cache không lọt vào git)
 - [ ] `git ls-files | grep export_presets` → không có kết quả
-- [ ] `git log --oneline` → có đúng 1 commit
+- [ ] `git log --oneline` → có ít nhất 1 commit, và commit gần nhất đã được push
 - [ ] `du -sh .git` → dưới 5 MB
 
 **GitHub**
